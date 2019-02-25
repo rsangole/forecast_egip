@@ -1,0 +1,508 @@
+---
+title: 'Forecasting - Industrial Production: Electric and gas utilities'
+author: "R Sangole"
+date: "Feb 24 2018"
+output:
+  html_document:
+    df_print: paged
+    toc: yes
+    toc_depth: '2'
+  html_notebook:
+    fig_height: 4
+    fig_width: 9
+    highlight: tango
+    number_sections: yes
+    theme: journal
+    toc: yes
+    toc_depth: 2
+    toc_float: yes
+---
+
+**Objective**
+
+1. Forecast 5 years
+2. Understand likelihood that prod index surpasses 135
+
+# Libraries
+
+Importing a few libraries needed for this analysis.
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(forecast)
+library(dygraphs)
+library(astsa)
+library(urca)
+library(ggthemr)
+```
+
+# Data Import & Preprocessing
+
+There are two pieces of data I was able to pull from the [source](https://fred.stlouisfed.org/series/IPG2211A2N). 
+
+1. The 'Industrial Production: Electric and gas utilities', labeled data _IPG2211A2N_
+1. The time periods for recession, as shown in gray in the plot online
+
+These are downloaded as csv files, and some preprocessing is done to shape them in a format ready for modeling.
+
+```{r message=FALSE, warning=FALSE}
+df <- read_csv("../data/IPG2211A2N.csv",col_names = c("date","ip_index"),skip = 1)
+recession <- read_csv("../data/recession.csv",col_names = c("start","end"),skip = 1)
+
+recession_dates = recession %>% mutate(range = map2(start,end,~seq(from = .x,to = .y,by = "month"))) %>% select(range) %>% unnest() %>% pull()
+```
+
+```{r message=FALSE, warning=FALSE}
+head(df)
+head(recession)
+```
+
+The electric and gas index is stored as a time series `ts` object, since quite a bit of the forecasting and plotting functions prefer `ts` as opposed to `data.frame` or `tibble` objects.
+
+```{r}
+egip <- ts(data = df$ip_index,
+           start = 1939,
+           frequency = 12,
+           names = "egip")
+head(egip,18)
+```
+
+# EDA
+
+Let's visualize the data. The graph shows the monthly values of Electric Gas Industrial Production (EGIP). The gray bars show the recessions. Initial observations:
+
+1. Not a stationary series. Strong presence of a trend throughout the time series, although much steeper slope of the trend till ~2009. After the 2009 recession, I can see a much lower, albeit positive trend.
+1. Definite presence of prediodic behavior on almost the entire time series. 'Almost' since pre-1948, ther seems to be little/no seasonality at all. (Zoom in to check this). Another observation is that visually, the seasonality between 1960-1973 is almost  constant, i.e. after accounting for the trend, each Jan is roughly equal to Aug. From 1973 onwards, I see a marked change in this  seasonal behaviour with the Jan peaks much higher than the Aug peaks. 
+1. Zooming into any one year, we can see a 'double dip': EGIP is larger in Dec-Jan, and Jul-Aug time frame, i.e. every 6 months. Presumeably, this is could be due to higher cooling costs at peak summer and and higher heating costs at peak winter. This double dip is consistantly present throughout the series.
+1. Whereever there are active recessions, I notice that the peaks are a bit lower than the preceding non-recession years (1974). In some cases, the trend actually changes direction too (1981, 2009).
+1. The variance of the series increases with time. I would want to address this first.
+
+```{r fig.height=4, fig.width=9, message=FALSE, warning=FALSE}
+dygraph_plotter <- function(ts, recession, title = NULL){
+        command <- paste0("dygraph(",ts,",xlab = 'Year', ylab = 'Industrial Production: Electric & Gas', main = '", title, "') %>% ",
+        glue::glue("dyShading(from = recession$start[{x}],to = recession$end[{x}]) %>% ",x=1:nrow(recession)) %>% paste0(collapse = ""),
+        "dyRangeSelector()")
+        eval(parse(text = command))
+}
+dygraph_plotter("egip", recession)
+```
+
+The seasonplots plot the time series data split by each "season", in our case, by "Year". This plot clearly shows what we've already noticed - levels go up over the years, seasonality becomes more pronounced.
+
+```{r fig.height=7, fig.width=10}
+ggseasonplot(egip)
+```
+
+Zooming into the data from Y:2000, we can see that - on average -  EGIP increases every year for all the months.
+
+```{r fig.height=4, fig.width=9, message=FALSE, warning=FALSE}
+ggsubseriesplot(window(egip, start=2000))+labs(y="EGIP")
+```
+
+# Modeling Approach
+
+Considering these initial observations, here's the modeling approach I am proposing:
+
+1. Split the data into train & test.
+1. For the Training Sets (TS), I have two ideas in mind:
+    a. TS1: Keep the entire time series as is and perform some modeling
+    a. TS2: Eliminate some of the initial portion of the time series data where the seasonality is non-existant or different
+1. For each type of TS, apply a few models - 
+    a. Seasonal Naive (to get a baseline performance value), 
+    a. ARIMA (Auto-Regressive Integrated Moving Average), 
+    a. Dynamic regression models (regression model with errors following ARIMA model),
+    a. ETS (Exponential Smoothing),
+    a. STLF (Seasonal decomposition of Time-series using Loess), 
+    a. Prophet
+1. Select the method which most reduces the prediction error on the test dataset
+1. I'll also try an weighted approach, which will weight these different forecasts together, in an attempt to generate a better point forecast from an ensemble model rather than an individual model
+
+*Note:*
+
+I investigated _2(a)_ for most of the models listed in _3_. I found that they quite underperformed when compared against approach _2(b)_. In particular, they all overestimated the trend component in the forecasts, resulting in consistantly biased forecasts. Approach _2(b)_ on the other hand, worked much better in estimating the forecasts. Thus, in the rest of the report, I will only be speaking about approach _2(b)_.
+
+## Selection criteria
+
+1. While model building, we can use parameters like AIC or BIC to select the better model parameters.
+1. Model performance can be judged using metrics like MASE (Mean Abs Scaled Error)
+
+# Train & Test Split
+
+Here, I split the data into training (1984 - 2014) and testing (>2014). I'm keeping 5 years in testing since the task is to forecast out 5 years, and this is a typical practice. **Note** - this is where I'm subsetting to data 1984+ only.
+
+```{r}
+egip_train = window(egip, start = 1984, end = 2013+11/12)
+egip_test = window(egip, start = 2014)
+h = length(egip_test) #forecast length
+```
+
+# Transformations
+
+I used the Box-Cox test to determine the value of lamda to perform the transformation. Transforming the series using this value, we can see that the variance is much stabilized than the original series. Var names have prefix "t" to indicate transformed series.
+
+```{r fig.height=4, fig.width=9, message=FALSE, warning=FALSE}
+lam = BoxCox.lambda(egip_train)
+tegip_train = BoxCox(egip_train, lam)
+tegip_test = BoxCox(egip_test, lam)
+dygraph_plotter("tegip_train", recession, title = paste0("Box Cox Transformed Training Data. Lamda = ", round(lam,4)))
+```
+
+# Models
+
+## Seasonal Naive Forecasts
+
+Running a simplistic seasonal naive forecast first. This can also serve a baseline - no reason to select anything more complex of a seasonal naive works well. We can see that it works reasonably well, though we do miss out on a few peaks and troughs.
+
+```{r fig.height=4, fig.width=9, message=FALSE, warning=FALSE}
+snaiveForecast <- snaive(tegip_train,h = h) 
+snaiveForecast %>% autoplot() + autolayer(tegip_test) + 
+        scale_x_continuous(limits = c(2010,2019),breaks = seq(2010,2019))+
+        scale_y_continuous(limits=c(3,3.25))
+snaiveForecast %>% accuracy(tegip_test)
+```
+
+## ARIMA
+
+Using the box-jenkins framework might prove promising, given the seasonality present in the dataset. First step is to make the non-stationary data stationary. A quick investigation into how many diffs to consider can be done using `ndiffs` and `nsdiffs`.
+
+### Single differening d = 1
+
+```{r}
+tegip_train %>% 
+        diff() %>% 
+        dygraph() %>% 
+        dyOptions(drawPoints = TRUE, pointSize = 2) %>% 
+        dyLimit(mean, color = "red") %>% 
+        dyLimit(mean(diff(tegip_train),na.rm=T),color = "red") %>% 
+        dyRangeSelector()
+```
+
+Check for stationarity, this series is stationary since the test-statistic is less than the 1% critical value.
+
+```{r}
+tegip_train %>% diff(d = 1) %>% ur.kpss() %>% summary()
+```
+
+### Seasonal Difference D[12] = 1
+
+There is still some trending left, and as a result the KPSS test fails stationarity.
+
+```{r}
+tegip_train %>% 
+        diff(lag = 12) %>% 
+        dygraph() %>% 
+        dyOptions(drawPoints = TRUE, pointSize = 3) %>% 
+        dyLimit(mean, color = "red") %>% 
+        dyLimit(mean(diff(diff(tegip_train)),na.rm=T),color = "red") %>% 
+        dyRangeSelector()
+```
+
+```{r}
+tegip_train %>% diff(lag = 12) %>% ur.kpss() %>% summary()
+```
+
+### Seasonal Difference D[12] = 1 followed by simple differencing d=1
+
+Adding a simple difference to the previous result makes the signal quite stationary. KPSS test proves this too.
+
+```{r}
+tegip_train %>% 
+        diff(lag = 12) %>% 
+        diff() %>% 
+        dygraph() %>% 
+        dyOptions(drawPoints = TRUE, pointSize = 3) %>% 
+        dyLimit(mean, color = "red") %>% 
+        dyLimit(mean(diff(diff(tegip_train)),na.rm=T),color = "red") %>% 
+        dyRangeSelector()
+```
+```{r}
+tegip_train %>% diff(lag = 12) %>% diff() %>% ur.kpss() %>% summary() # Stationary
+```
+
+Let's stick with the the D=12 + d=1. I suspect it will be required based on the seasonality. The ACF/PACF plots should tell us more.
+
+```{r}
+d1D12tegip_train = diff(diff(tegip_train, lag=12))
+```
+
+What do the ACF plots tell us?
+
+```{r message=FALSE, warning=FALSE}
+d1D12_acf = acf2(d1D12tegip_train, plot = T, max.lag = 12*4)
+```
+
+Note: in these graphs, the LAG are shown in units of 12-months.
+
+For the d1D12 data, it seems like there is a sharp decline in the seasonal component (integer LAG values) in the ACF, while a slower decay in the PACF. Could indicate presence of a MA(2) for the seasonal component (Q).  Hard to infer the 'p' and 'q' components visually. I could guess p=2 and q=2 based on the sub-LAG components. 
+
+So perhaps an SARIMA(2,1,2)(0,1,2)[12] on the box-cox transformed time series is a potential model. Perhaps a SARIMA(1,1,1)(0,1,2)[12]. Let's investigate.
+
+**ARIMA MODEL 1**
+
+In the SARIMA(1,1,1)(0,1,2)[12], residuals are quite normal (except a few outliers at the edges). ACF plots show a few components outside the limits, as affirmed by the joint-test Ljung-Box test, which has p-values below 0.05 for all lag values. This indicates we've failed the null hypothesis test that the residuals are no different from white noise.
+
+```{r message=FALSE, warning=FALSE}
+arimaFit1 <- sarima(xdata = tegip_train,
+       p = 0,d = 1,q = 1,
+       P = 0,D = 1,Q = 2,S = 12)
+arimaFit1$fit
+```
+
+**ARIMA MODEL 2**
+
+SARIMA(2,1,2)(0,1,2)[12] is much more promising. We pass the Ljung-Box test in this instance, and the residuals look good too.
+
+```{r}
+arimaFit2 = sarima(xdata = tegip_train,
+       p = 2,d = 1,q = 2,
+       P = 0,D = 1,Q = 2,S = 12)
+arimaFit2$fit
+```
+
+**ARIMA MODEL 3**
+
+As a quick check, let's see what `forecast::auto.arima` gives us. We get seasonal AR component (P=2) and a smaller seasonal MA component (Q=1). This is a better model (lower AIC of -2156 compared to -2122) than my model above, and the Ljung-Box test passes as well. Let's continue with this model.
+
+```{r}
+arimaFit3 <- auto.arima(tegip_train)
+arimaFit3
+arimaFit3 %>% checkresiduals()
+```
+
+This model performs quite well, with consistant results on the test dataset as well.
+
+```{r warning=FALSE}
+arimaFit3 %>% forecast(h=h) %>% autoplot() + autolayer(tegip_test) + 
+        scale_x_continuous(limits = c(2010,2019),breaks = seq(2010,2019))+
+        scale_y_continuous(limits=c(3,3.25))
+arimaFit3 %>% forecast(h=h) %>% accuracy(tegip_test)
+```
+
+## Dynamic Regression Modeling
+
+Here, I wanted to check if introducing an regressor like presence/absence of recession windows as an indicator variable, to see if it improves the ARIMA modeling in any capacity. I've also added each month as an indicator variable. The recession indicator doesn't seem significant. (I also tried other indicators - # of years after recession ended etc, none were significant). Although we see a slightly smaller AIC for this model, the residuals do not pass the Ljung-Box test. I'm not continuing with this approach.
+
+```{r}
+recession_end_years = recession %>% mutate(years = lubridate::year(end)) %>% pull(years)
+df <- df %>% mutate(rec_indicator = ifelse(date %in% recession_dates,1,0))
+months <- as.factor(lubridate::month(df$date))
+months <- model.matrix(~months)[,-1]
+dfa <- df %>% bind_cols(as_tibble(months))
+xreg_mat_train <- as.matrix(dfa[dfa$date>"1983-12-01" & dfa$date<"2014-01-01",-1:-2])
+xreg_mat_test <- as.matrix(dfa[dfa$date>"2013-12-01",-1:-2])
+
+arima_xreg_Fit <- auto.arima(tegip_train, stepwise = F,
+                             xreg = xreg_mat_train, 
+                             trace = F, )
+arima_xreg_Fit
+arima_xreg_Fit %>% checkresiduals()
+```
+
+## ETS
+
+ETS models use exponentially weighted past observations to produce new forecasts. There are quite a few available models, depending on if the Trend, Seasonal and Errors components are Additive, Additive Damped, Multiplicative etc. We can search for the best possible option (based off of AICc) using `ets`. Here, it selects an (M,A,M) model, which is - multiplicative trend, additive seasonality, and multiplicative errors.
+
+The really small value of beta indicates that the slope changes little. The damping was important to add in this model, without it, the model was completely overshooting the forecast.
+
+```{r}
+etsFit <- ets(tegip_train, damped = TRUE) # damped = NULL lets the model select if damping is needed
+etsFit
+```
+
+```{r message=FALSE, warning=FALSE}
+etsFit %>% forecast(h=h) %>% autoplot()+ autolayer(tegip_test) +
+        scale_x_continuous(limits = c(2010,2019),breaks = seq(2010,2019))+
+        scale_y_continuous(limits=c(3,3.25)) 
+```
+
+While the training set metrics are only decent (MASE = 0.6), the test set performance is quite poor (MASE of 1.12).
+
+```{r}
+etsFit %>% forecast(h=h) %>% accuracy(tegip_test)
+```
+
+## STL
+
+STL decomposing time series into seasonal, trend and irregular components using LOESS can be used for forecasting as well. It's a simple model to execute, with a few tunable parameters like `t.window` and `s.window` which control the width of the signals used for trend and seasonal extraction. The `t.window` indicates how many consequtive points to use for trend extraction; lower numbers allow more flexible trends. `s.window` indicates how many consqutive years to use while calculating the seasonal components; lower numbers allow seasonality to change quicker. 
+
+I've played around with the numbers a bit to get to state I liked. The trend is fairly smooth. The seasonality captures some intersting insights. In 1985, there is predominant "W" shape to the seasonality... as we go towards 2015, it's a more like a "double-U" shape.
+
+```{r message=FALSE, warning=FALSE}
+stlFit <- tegip_train %>% stl(t.window = 15, s.window = 5)
+autoplot(stlFit)
+```
+
+Do the residuals of this STL decomposition still carry information? *YES*. The ACF shows significant lags which indicates the residuals are not white noise.
+
+```{r}
+checkresiduals(stlFit$time.series[,"remainder"])
+```
+
+Forecasting using this method, the seasonal components are kept to using a naive approach, while the remainder (Seasonally Adjusted) portion is done using a random walk. We can tell that this method is worse than simply using a seasonal naive model.
+
+```{r message=FALSE, warning=FALSE}
+stlForecast <- stlFit %>% forecast(method = "naive", h = h) 
+stlForecast %>% autoplot() + autolayer(tegip_test) + scale_x_continuous(limits = c(2010,2019)) + scale_y_continuous(limits=c(3,3.25))
+stlForecast %>% accuracy(tegip_test)
+```
+
+## Prophet
+
+[Prophet](https://facebook.github.io/prophet/) is a forecasting tool implemented by our colleagues at Facebook, which can perform quite sophisticated forecasts by considering a large number of input & tunable parameters. I'll be honest - I've only used it a handful of times at work to test some of it's outlier resistance. So it's quite a black box for me. I'm using it here to test how well it does "out of the box", but I won't spend any time tuning it.
+
+```{r fig.height=4, fig.width=9, message=FALSE, warning=FALSE}
+library(prophet)
+proph_df_train <- tibble(ds = seq(as.Date("1984-01-01"),as.Date("2013-12-01"),by = "month"),
+                         y = as.numeric(tegip_train))
+m <- prophet(proph_df_train)
+future <- make_future_dataframe(m, periods = h, freq = "month")
+forecast <- predict(m, future)
+dyplot.prophet(m, forecast)
+```
+```{r}
+prophet_forecast <- ts(forecast$yhat[forecast$ds>"2013-12-01"], start = start(tegip_test), frequency = frequency(tegip_test))
+Q = sum(abs(diff(tegip_test,lag = frequency(tegip_test))))/(length(tegip_test)-frequency(tegip_test))
+MASE = mean(abs(tegip_test - prophet_forecast))/Q
+RMSE = sqrt(mean((tegip_test - prophet_forecast)^2))
+prophet_yhat = ts.intersect(prophet_forecast, tegip_test)
+plot(prophet_yhat,plot.type="single",col=1:2,ylab="EGIP", sub="Red: Actual, Black: Forecast",
+     main = paste0("Test Set RMSE: ",round(RMSE,3), "   ", "Test Set MASE: ", round(MASE,3)))
+```
+
+The residuals for this model are decent. I see a few locations where ACF and PACF are violating the limits, and the Ljung-Box test does fail at the 0.05 level.
+
+```{r}
+prophet_residuals = prophet_yhat[,1]-prophet_yhat[,2]
+acf_prophet = acf2(prophet_residuals)
+Box.test(prophet_residuals,lag = 36, type = "Ljung-Box")
+```
+
+## Ensemble
+
+There are a few packages which do perform ensemble time series modeling like `forecastHybrid`, I haven't used them much. However, this following "benchmarking" code (obtained from [here](https://robjhyndman.com/hyndsight/benchmark-combination/)) is something Hyndman wrote which beautifully takes a few models, runs all combinations of simple averaging across their forecast values, and returns the best possible combination. Often, an average of forecasts outperformans any single model.
+
+Here, I'm combining Seasonal Naive, ETS, ARIMA, STL and Prophet forecasts. In total, this code will check 31 combinations. Each letter here corresponds to a model. Thus, "NE" = Average of "SNaive" & "ETS".
+
+N = Seasonal Naive
+E = ETS
+A = ARIMA
+S = STL
+P = Prophet
+
+```{r}
+benchmarks <- function(y, h) {
+  require(forecast)
+  # Compute four benchmark methods
+  fcasts <- rbind(
+    N = snaive(y, h)$mean,
+    E = forecast(ets(y), h)$mean,
+    A = forecast(auto.arima(y), h)$mean,
+    S = stlf(tegip_train,h=h)$mean,
+    P = prophet_forecast)
+  colnames(fcasts) <- seq(h)
+  method_names <- rownames(fcasts)
+  # Compute all possible combinations
+  method_choice <- rep(list(0:1), length(method_names))
+  names(method_choice) <- method_names
+  combinations <- expand.grid(method_choice) %>% tail(-1) %>% as.matrix()
+  # Construct names for all combinations
+  for (i in seq(NROW(combinations))) {
+    rownames(combinations)[i] <- paste0(method_names[which(combinations[i, ] > 0)], 
+      collapse = "")
+  }
+  # Compute combination weights
+  combinations <- sweep(combinations, 1, rowSums(combinations), FUN = "/")
+  # Compute combinations of forecasts
+  return(combinations %*% fcasts)
+}
+
+benchmarks_out <- benchmarks(tegip_train, h)
+```
+
+This plot shows ALL the 31 combinations together - not too much insight here; quite an eye chart.
+
+```{r}
+ts(t(benchmarks_out),start=start(egip_test),frequency = 12) %>% autoplot() + autolayer(tegip_test,color='black',lty=2)
+```
+
+If I pick MAE as the metric of performance to compare these models, here I plot the distribution of MAE for the *test set*, sorted by the median MAE value. The top three models here are - AP, NA and NAP. Let's plot them in a time series plot next.
+
+```{r fig.width=11, message=FALSE, warning=FALSE}
+ggthemr("fresh")
+benchmarks_df = t(benchmarks_out) %>% as_tibble()
+benchmarks_df$y = tegip_test
+benchmarks_df = benchmarks_df[,32] %>% bind_cols(benchmarks_df[,-32])
+#MAE
+mean_MAE = benchmarks_df[,-1] %>% map_df(~abs(.x-benchmarks_df$y)) %>% gather() %>% group_by(key) %>% summarize(m=median(value)) %>% mutate(key = factor(key,levels=key[order(m)]))
+benchmarks_df[,-1] %>% map_df(~abs(.x-benchmarks_df$y)) %>% gather() %>% mutate(key = factor(key, levels = levels(mean_MAE$key))) %>% ggplot(aes(key,value))+geom_boxplot() + coord_flip() + labs(x="Model",y="Test Set MAE")
+ggthemr_reset()
+```
+
+Visually, these are extremely similar in performance. I'm picking the "AP" model for the final forecasts.
+
+```{r}
+ts(t(benchmarks_out[c("AP","NA","NAP"),]),start=start(egip_test),frequency = 12) %>% autoplot() + autolayer(tegip_test,color='black',lty=2)
+```
+
+# Final Pt Estimate
+
+Running the models again on the full (train+test) portions of the data, for Prophet and ARIMA models, and calculating their mean values to estimate the 5-year forecast post Jan-2019.
+
+```{r message=FALSE, warning=FALSE}
+tegip = BoxCox(window(egip,start=1984), lam)
+
+# Prophet
+proph_df <- tibble(ds = seq(as.Date("1984-01-01"),as.Date("2019-01-01"),by = "month"),
+                         y = as.numeric(tegip))
+m <- prophet(proph_df_train)
+future <- make_future_dataframe(m, periods = 12*5, freq = "month")
+forecast <- predict(m, future)
+yhat_P <- tail(forecast$yhat,60)
+
+# ARIMA
+yhat_A = Arima(tegip,c(2,1,2),c(2,1,1)) %>% forecast(h=60) %>% .$mean
+
+final_yhat = (yhat_P+yhat_A)/2
+final_yhat = InvBoxCox(final_yhat, lam)
+
+autoplot(egip)+autolayer(final_yhat)+
+        scale_x_continuous(limits = c(2010,2024),breaks = seq(2010,2024))+
+        theme(legend.position = "none")+
+        labs(y="EGIP")
+```
+
+# What is the likelihood that the index passes 135, atleast once?
+
+One of the pitfalls of the ensemble approach is the estimation of the prediction intervals. There could be a way to analytically compute and combine the PI for the two approaches, though I will have to look into this.
+
+Another way to computationally to so is to calculate the intervals using bootstrapping approaches on simulated time series. Hyndman describes this [here](https://otexts.com/fpp2/bootstrap.html). Using some bootstrapping techniques, he first creates many representative similar time series, then applies a model like ETS / ARIMA to each series, and finally obtains a heuristic prediction interval.
+
+I haven't done this method before, but I want to learn more about it. So I'll note it down as a potential future improvement item to this task. [I tried using it here, but it requires creation of a fitted_model object for `simulate`.]
+
+For now, I'm going to use just 1 model, namely the ARIMA model, and get prediction intervals. These are shown below. The dashed line shows the 135 cutoff in question. We can see that in Jan, for years 2022, 2023 and 2024, there is a possibility that the point estimate may cross 135. In 2014, for ex, the model says we should expect the mean estimate to be between 3.17 and 3.27 (for a confidence of 95%); this contains the threshold of 3.25. (BoxCox-ed 135).
+
+The prediction intervals created by auto.arima are quite optimistic. What the model isn't accounting for is the variation in the predictions due to parameter estimates. 
+
+```{r message=FALSE, warning=FALSE}
+Arima(tegip,c(2,1,2),c(2,1,1)) %>% forecast(h=60) %>% autoplot()+
+        geom_hline(yintercept = BoxCox(135,lam), lty=2) + 
+        scale_x_continuous(limits = c(2017,2024),breaks = seq(2017,2024))+
+        labs(y="EGIP", caption="The 135 limit is shown after Box-Cox transformation here.")
+```
+
+Visually, we can plot the distribution of mean estimates for Jan-2024. Just for Jan-2024, the area to the right of the red line indicates the probability of obtaining a mean > threshold, in this case, 8.6%.
+
+```{r}
+sigma_h = 0.02440663 #Calculated from the forecast object using y_PI = y_hat_mean + 1.96 * sigma_h
+mu = 3.221144
+thr = 3.254454
+hist(rnorm(1000, mu, sigma_h))
+abline(v=thr, col="red")
+#1-pnorm(mean = mu, sd = sigma_h, q = thr)
+```
+
+# Final observations & Communication to the team
+
+1. The point forecasts for the test dataset did quite well, for the ensemble models (like AP, NA and NAP) as well as for the pure ARIMA models. I did miss some troughs (like Apr 2016, Apr 2017) and some high peaks (like Jan 2018). It's possible I can improve these forecasts if I include more information. Perhaps temperature data, or some other measure of activity/consumption.
+1. I want to investigate further the utlization of bootstrapping to determine the prediction intervals, especially for these types of ensemble models
+1. Many of these models show promise. For a 1st review with the stakeholders, we should proceed with one of the forecasts which can be explained (like the ARIMA, or Seasonal Naive). Once we get buy-in from the stakeholders to the potential of delivering accurate forecasts, we can introduce to them the more complex methods (like ensembling), assuming that forecasting accuracy (not explainability) is the most important performance metric.
